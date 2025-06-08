@@ -6,6 +6,8 @@ from rlbot.utils.structures.quick_chats import QuickChats
 from rlgym_compat import GameState
 import math
 import random
+import configparser
+import os
 from .agent import Agent
 from .nexto_obs import NextoObsBuilder, BOOST_LOCATIONS
 
@@ -35,14 +37,46 @@ class Nexto(BaseAgent):
 
         self.obs_builder = None
         self.agent = Agent()
-        self.tick_skip = 8
+
+        # Default tuning values which may be overridden by bot.cfg
+        self.tuning = {
+            "tick_skip_1v1": 8,
+            "tick_skip_2v2": 6,
+            "tick_skip_3v3": 6,
+            "beta_1v1": beta,
+            "beta_2v2": beta * 0.9,
+            "beta_3v3": beta * 0.8,
+            "kickoff_1v1": hardcoded_kickoffs,
+            "kickoff_2v2": hardcoded_kickoffs,
+            "kickoff_3v3": False,
+        }
+
+        cfg = configparser.ConfigParser()
+        cfg_path = os.path.join(os.path.dirname(__file__), "bot.cfg")
+        if os.path.exists(cfg_path):
+            cfg.read(cfg_path)
+            if cfg.has_section("Tuning"):
+                for key in list(self.tuning.keys()):
+                    if cfg.has_option("Tuning", key):
+                        if key.startswith("tick_skip"):
+                            self.tuning[key] = cfg.getint("Tuning", key)
+                        elif key.startswith("beta"):
+                            self.tuning[key] = cfg.getfloat("Tuning", key)
+                        else:
+                            self.tuning[key] = cfg.getboolean("Tuning", key)
+
+        # Start with 1v1 values until the mode is detected
+        self.tick_skip = self.tuning["tick_skip_1v1"]
 
         # Beta controls randomness:
         # 1=best action, 0.5=sampling from probability, 0=random, -1=worst action, or anywhere inbetween
-        self.beta = beta
+        self.beta = self.tuning["beta_1v1"]
         self.render = render
-        self.hardcoded_kickoffs = hardcoded_kickoffs
+        self.hardcoded_kickoffs = self.tuning["kickoff_1v1"]
         self.stochastic_kickoffs = stochastic_kickoffs
+
+        # Will be set after we know team size
+        self.tuned = False
 
         self.game_state: GameState = None
         self.controls = None
@@ -86,6 +120,24 @@ class Nexto(BaseAgent):
         self.update_action = True
         self.kickoff_index = -1
 
+    def apply_tuning(self, num_teammates: int):
+        if num_teammates == 0:
+            self.tick_skip = self.tuning["tick_skip_1v1"]
+            self.beta = self.tuning["beta_1v1"]
+            self.hardcoded_kickoffs = self.tuning["kickoff_1v1"]
+        elif num_teammates == 1:
+            self.tick_skip = self.tuning["tick_skip_2v2"]
+            self.beta = self.tuning["beta_2v2"]
+            self.hardcoded_kickoffs = self.tuning["kickoff_2v2"]
+        else:
+            self.tick_skip = self.tuning["tick_skip_3v3"]
+            self.beta = self.tuning["beta_3v3"]
+            self.hardcoded_kickoffs = self.tuning["kickoff_3v3"]
+
+        # reset tick counter to align with new tick_skip value
+        self.ticks = self.tick_skip
+        self.tuned = True
+
     def render_attention_weights(self, weights, positions, n=3):
         if weights is None:
             return
@@ -120,6 +172,11 @@ class Nexto(BaseAgent):
         ticks_elapsed = round(delta * 120)
         self.ticks += ticks_elapsed
         self.game_state.decode(packet, ticks_elapsed)
+
+        if not self.tuned:
+            mates = [c for i, c in enumerate(packet.game_cars[:packet.num_cars])
+                     if i != self.index and c.team == self.team]
+            self.apply_tuning(len(mates))
 
         if self.isToxic:
             self.toxicity(packet)
